@@ -1,12 +1,14 @@
-"""SODIQLIK TIZIMI - Telegram loyalty bot (usta/dizayner/prorab uchun bonus).
-Bonus FORWARD: 100mln 1%, 200mln 2%, 300mln 3%, 400mln 4% (doimiy)."""
+"""SODIQLIK TIZIMI - Telegram loyalty bot (hamkor + sotuvchi profillari)."""
 
 import asyncio
 import logging
 import os
+import random
 import re
 import sqlite3
 import threading
+import json
+import urllib.request
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -26,6 +28,7 @@ from aiogram.types import (
 N = chr(10)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "1234")
+GSHEET_URL = os.getenv("GSHEET_URL", "")
 SUPER_ADMINS = {
     int(x) for x in os.getenv("SUPER_ADMINS", "").replace(" ", "").split(",") if x
 }
@@ -38,7 +41,6 @@ TIERS = [
     (100_000_000, 1),
     (0, 0),
 ]
-
 CATEGORIES = ["Usta", "Dizayner", "Prorab"]
 
 logging.basicConfig(level=logging.INFO)
@@ -71,16 +73,29 @@ def db_init():
                 bonus INTEGER NOT NULL,
                 turnover_after INTEGER NOT NULL,
                 customer TEXT,
-                admin_id INTEGER,
+                seller_id INTEGER,
+                seller_name TEXT,
                 created_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS admins (
+            CREATE TABLE IF NOT EXISTS owners (
                 telegram_id INTEGER PRIMARY KEY,
                 name TEXT,
                 created_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS sellers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                code TEXT UNIQUE NOT NULL,
+                telegram_id INTEGER,
+                created_at TEXT
+            );
             """
         )
+        for col in ["seller_id INTEGER", "seller_name TEXT"]:
+            try:
+                _conn.execute("ALTER TABLE sales ADD COLUMN " + col)
+            except Exception:
+                pass
         _conn.commit()
 
 
@@ -105,10 +120,21 @@ def get_client_by_tg(tg_id):
     return q("SELECT * FROM clients WHERE telegram_id=?", (tg_id,), fetch="one")
 
 
-def is_admin(tg_id):
+def is_owner(tg_id):
     return tg_id in SUPER_ADMINS or q(
-        "SELECT 1 FROM admins WHERE telegram_id=?", (tg_id,), fetch="one"
+        "SELECT 1 FROM owners WHERE telegram_id=?", (tg_id,), fetch="one"
     ) is not None
+
+
+def get_seller_by_tg(tg_id):
+    return q("SELECT * FROM sellers WHERE telegram_id=?", (tg_id,), fetch="one")
+
+
+def gen_code():
+    while True:
+        code = str(random.randint(100000, 999999))
+        if not q("SELECT 1 FROM sellers WHERE code=?", (code,), fetch="one"):
+            return code
 
 
 def normalize_phone(text):
@@ -155,49 +181,64 @@ def next_tier_info(turnover):
     return None
 
 
+def _sheet_sync_blocking():
+    if not GSHEET_URL:
+        return
+    partners = q("SELECT full_name, phone, category, total_turnover, total_bonus FROM clients ORDER BY total_turnover DESC", fetch="all")
+    plist = [{"name": p["full_name"], "phone": p["phone"], "category": p["category"], "turnover": p["total_turnover"], "percent": percent_for(p["total_turnover"]), "bonus": p["total_bonus"]} for p in partners]
+    sellers = q("SELECT s.name AS nm, COUNT(sa.id) AS cnt, COALESCE(SUM(sa.amount), 0) AS turn, COALESCE(SUM(sa.bonus), 0) AS bon FROM sellers s LEFT JOIN sales sa ON sa.seller_id = s.id GROUP BY s.id ORDER BY turn DESC", fetch="all")
+    slist = [{"name": r["nm"], "count": r["cnt"], "turnover": r["turn"], "bonus": r["bon"]} for r in sellers]
+    srow = q("SELECT COUNT(*) c, COALESCE(SUM(total_turnover), 0) t, COALESCE(SUM(total_bonus), 0) b FROM clients", fetch="one")
+    scnt = q("SELECT COUNT(*) c FROM sales", fetch="one")["c"]
+    payload = {"partners": plist, "sellers": slist, "stats": {"clients": srow["c"], "sales": scnt, "turnover": srow["t"], "bonus": srow["b"]}}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(GSHEET_URL, data=body, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=20)
+    except Exception as e:
+        logger.warning("Sheet sync: %s", e)
+
+
+async def sync_sheet():
+    try:
+        await asyncio.to_thread(_sheet_sync_blocking)
+    except Exception as e:
+        logger.warning("sync_sheet: %s", e)
+
+
 def client_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📊 Statistikam")],
-            [KeyboardButton(text="🏆 Bonus bosqichlari")],
-        ],
-        resize_keyboard=True,
-    )
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📊 Statistikam")], [KeyboardButton(text="🏆 Bonus bosqichlari")]], resize_keyboard=True)
 
 
-def admin_menu():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="➕ Savdo qoshish")],
-            [KeyboardButton(text="🔍 Mijozni tekshirish")],
-            [KeyboardButton(text="👥 Mijozlar"), KeyboardButton(text="📊 Hisobot")],
-            [KeyboardButton(text="🚪 Admin chiqish")],
-        ],
-        resize_keyboard=True,
-    )
+def owner_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Savdo qoshish")],
+        [KeyboardButton(text="👥 Mijozlar"), KeyboardButton(text="🧾 Sotuvchilar")],
+        [KeyboardButton(text="➕ Sotuvchi qoshish"), KeyboardButton(text="🗑 Sotuvchi ochirish")],
+        [KeyboardButton(text="🔍 Mijozni tekshirish"), KeyboardButton(text="📊 Hisobot")],
+        [KeyboardButton(text="🚪 Chiqish")],
+    ], resize_keyboard=True)
+
+
+def seller_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Savdo qoshish")],
+        [KeyboardButton(text="🔍 Mijozni tekshirish")],
+        [KeyboardButton(text="📈 Mening natijam")],
+        [KeyboardButton(text="🚪 Chiqish")],
+    ], resize_keyboard=True)
 
 
 def contact_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="📱 Raqamni yuborish", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
 
 
 def category_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=c)] for c in CATEGORIES],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=c)] for c in CATEGORIES], resize_keyboard=True, one_time_keyboard=True)
 
 
 def cancel_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
-        resize_keyboard=True,
-    )
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
 
 
 class Reg(StatesGroup):
@@ -205,8 +246,12 @@ class Reg(StatesGroup):
     category = State()
 
 
-class AdminLogin(StatesGroup):
+class OwnerLogin(StatesGroup):
     password = State()
+
+
+class SellerLogin(StatesGroup):
+    code = State()
 
 
 class AddSale(StatesGroup):
@@ -222,23 +267,32 @@ class Lookup(StatesGroup):
     phone = State()
 
 
+class AddSeller(StatesGroup):
+    name = State()
+
+
+class DelSeller(StatesGroup):
+    code = State()
+
+
 router = Router()
 bot: Bot = None
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message, state):
     await state.clear()
-    tg_id = message.from_user.id
-    if is_admin(tg_id):
-        await message.answer("👋 Salom, admin! Savdo kiritishingiz mumkin.", reply_markup=admin_menu())
+    uid = message.from_user.id
+    if is_owner(uid):
+        await message.answer("👋 Salom, Rahbar! Boshqaruv paneli.", reply_markup=owner_menu())
         return
-    client = get_client_by_tg(tg_id)
+    seller = get_seller_by_tg(uid)
+    if seller:
+        await message.answer(f"👋 Salom, {seller['name']}! (sotuvchi)", reply_markup=seller_menu())
+        return
+    client = get_client_by_tg(uid)
     if client:
-        await message.answer(
-            f"👋 Salom, {client['full_name']}!{N}SODIQLIK TIZIMIga xush kelibsiz.",
-            reply_markup=client_menu(),
-        )
+        await message.answer(f"👋 Salom, {client['full_name']}!{N}SODIQLIK TIZIMIga xush kelibsiz.", reply_markup=client_menu())
         return
     await message.answer(
         f"👋 Assalomu alaykum!{N}{N}"
@@ -250,7 +304,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
 
 @router.message(F.contact)
-async def got_contact(message: Message, state: FSMContext):
+async def got_contact(message, state):
     if message.contact.user_id and message.contact.user_id != message.from_user.id:
         await message.answer("Iltimos, ozingizning raqamingizni yuboring.")
         return
@@ -261,39 +315,32 @@ async def got_contact(message: Message, state: FSMContext):
 
 
 @router.message(Reg.name)
-async def reg_name(message: Message, state: FSMContext):
+async def reg_name(message, state):
     await state.update_data(name=message.text.strip())
     await state.set_state(Reg.category)
     await message.answer("Yonalishingizni tanlang:", reply_markup=category_kb())
 
 
 @router.message(Reg.category)
-async def reg_category(message: Message, state: FSMContext):
+async def reg_category(message, state):
     cat = message.text.strip()
     if cat not in CATEGORIES:
         await message.answer("Iltimos, tugmalardan birini tanlang.")
         return
     data = await state.get_data()
-    phone = data["phone"]
-    name = data["name"]
-    tg_id = message.from_user.id
     now = datetime.now().isoformat(timespec="seconds")
-    existing = get_client_by_phone(phone)
+    existing = get_client_by_phone(data["phone"])
     if existing:
-        q("UPDATE clients SET full_name=?, category=?, telegram_id=? WHERE phone=?", (name, cat, tg_id, phone))
+        q("UPDATE clients SET full_name=?, category=?, telegram_id=? WHERE phone=?", (data["name"], cat, message.from_user.id, data["phone"]))
     else:
-        q("INSERT INTO clients(phone, full_name, category, telegram_id, created_at) VALUES(?,?,?,?,?)", (phone, name, cat, tg_id, now))
+        q("INSERT INTO clients(phone, full_name, category, telegram_id, created_at) VALUES(?,?,?,?,?)", (data["phone"], data["name"], cat, message.from_user.id, now))
     await state.clear()
-    await message.answer(
-        f"✅ Royxatdan otdingiz!{N}{N}"
-        f"Ism: <b>{name}</b>{N}Yonalish: <b>{cat}</b>{N}Raqam: <b>{phone}</b>{N}{N}"
-        f"Endi statistikangizni kuzatib borishingiz mumkin.",
-        reply_markup=client_menu(),
-    )
+    await message.answer(f"✅ Royxatdan otdingiz!{N}{N}Ism: <b>{data['name']}</b>{N}Yonalish: <b>{cat}</b>{N}{N}Endi statistikangizni kuzatib borishingiz mumkin.", reply_markup=client_menu())
+    await sync_sheet()
 
 
 @router.message(F.text == "📊 Statistikam")
-async def my_stats(message: Message):
+async def my_stats(message):
     client = get_client_by_tg(message.from_user.id)
     if not client:
         await message.answer("Avval /start orqali royxatdan oting.")
@@ -309,80 +356,216 @@ async def my_stats(message: Message):
     )
     nxt = next_tier_info(turnover)
     if nxt:
-        nxt_pct, need = nxt
-        text += f"{N}🎯 {nxt_pct}% gacha yana <b>{fmt(need)}</b> som kerak."
+        text += f"{N}🎯 {nxt[0]}% gacha yana <b>{fmt(nxt[1])}</b> som kerak."
     else:
         text += f"{N}🏆 Eng yuqori bosqichdasiz - har savdoga 4%!"
     if sales:
         text += f"{N}{N}<b>Oxirgi savdolar:</b>{N}"
         for s in sales:
-            d = s["created_at"][:10]
-            text += f"- {d}: {fmt(s['amount'])} som -> {s['percent']}% = <b>{fmt(s['bonus'])}</b>{N}"
+            text += f"- {s['created_at'][:10]}: {fmt(s['amount'])} som -> {s['percent']}% = <b>{fmt(s['bonus'])}</b>{N}"
     else:
         text += f"{N}{N}Hali savdolar yoq."
     await message.answer(text, reply_markup=client_menu())
 
 
 @router.message(F.text == "🏆 Bonus bosqichlari")
-async def tiers_info(message: Message):
+async def tiers_info(message):
     text = (
         f"🏆 <b>BONUS BOSQICHLARI</b>{N}"
-        f"Siz olib kelgan mijozlarning jami xaridiga qarab:{N}{N}"
+        f"Mijozlaringizning jami xaridiga qarab:{N}{N}"
         f"- 100 mln dan keyin -> <b>1%</b>{N}"
         f"- 200 mln dan keyin -> <b>2%</b>{N}"
         f"- 300 mln dan keyin -> <b>3%</b>{N}"
         f"- 400 mln dan keyin -> <b>4%</b>{N}{N}"
-        f"Har bosqichga bir marta chiqsangiz kifoya - keyingi har bir savdoga shu foizda bonus yoziladi. 400 mln dan keyin doimiy 4%."
+        f"Har bosqichga bir marta chiqsangiz kifoya - keyingi har bir savdoga shu foiz. 400 mln dan keyin doimiy 4%."
     )
     await message.answer(text, reply_markup=client_menu())
 
 
 @router.message(Command("admin"))
-async def admin_login_start(message: Message, state: FSMContext):
-    if is_admin(message.from_user.id):
-        await message.answer("Siz allaqachon adminsiz.", reply_markup=admin_menu())
+async def owner_login_start(message, state):
+    if is_owner(message.from_user.id):
+        await message.answer("Siz allaqachon rahbarsiz.", reply_markup=owner_menu())
         return
-    await state.set_state(AdminLogin.password)
-    await message.answer("🔑 Admin parolini kiriting:", reply_markup=cancel_kb())
+    await state.set_state(OwnerLogin.password)
+    await message.answer("🔑 Rahbar parolini kiriting:", reply_markup=cancel_kb())
 
 
-@router.message(AdminLogin.password)
-async def admin_login_check(message: Message, state: FSMContext):
+@router.message(OwnerLogin.password)
+async def owner_login_check(message, state):
     if message.text == "❌ Bekor qilish":
         await state.clear()
         await message.answer("Bekor qilindi.", reply_markup=ReplyKeyboardRemove())
         return
     if message.text.strip() == ADMIN_PASSWORD:
-        q("INSERT OR IGNORE INTO admins(telegram_id, name, created_at) VALUES(?,?,?)", (message.from_user.id, message.from_user.full_name, datetime.now().isoformat(timespec="seconds")))
+        q("INSERT OR IGNORE INTO owners(telegram_id, name, created_at) VALUES(?,?,?)", (message.from_user.id, message.from_user.full_name, datetime.now().isoformat(timespec="seconds")))
         await state.clear()
-        await message.answer("✅ Admin sifatida kirdingiz!", reply_markup=admin_menu())
+        await message.answer("✅ Rahbar sifatida kirdingiz!", reply_markup=owner_menu())
     else:
         await message.answer("❌ Parol notogri. Qayta urinib koring yoki bekor qiling.")
 
 
-@router.message(F.text == "🚪 Admin chiqish")
-async def admin_logout(message: Message, state: FSMContext):
-    if message.from_user.id in SUPER_ADMINS:
-        await message.answer("Siz super-adminsiz.", reply_markup=admin_menu())
+@router.message(Command("kirish"))
+async def seller_login_start(message, state):
+    await state.set_state(SellerLogin.code)
+    await message.answer("🔑 Sotuvchi kodingizni kiriting:", reply_markup=cancel_kb())
+
+
+@router.message(SellerLogin.code)
+async def seller_login_check(message, state):
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=ReplyKeyboardRemove())
         return
-    q("DELETE FROM admins WHERE telegram_id=?", (message.from_user.id,))
+    code = message.text.strip()
+    seller = q("SELECT * FROM sellers WHERE code=?", (code,), fetch="one")
+    if not seller:
+        await message.answer("❌ Bunday kod yoq. Qayta kiriting yoki bekor qiling.")
+        return
+    q("UPDATE sellers SET telegram_id=? WHERE id=?", (message.from_user.id, seller["id"]))
     await state.clear()
-    await message.answer("Admin rejimidan chiqdingiz.", reply_markup=ReplyKeyboardRemove())
+    await message.answer(f"✅ Xush kelibsiz, {seller['name']}! Endi savdo kiritishingiz mumkin.", reply_markup=seller_menu())
+
+
+@router.message(F.text == "🚪 Chiqish")
+async def logout(message, state):
+    uid = message.from_user.id
+    if uid in SUPER_ADMINS:
+        await message.answer("Siz super-adminsiz.", reply_markup=owner_menu())
+        return
+    q("DELETE FROM owners WHERE telegram_id=?", (uid,))
+    q("UPDATE sellers SET telegram_id=NULL WHERE telegram_id=?", (uid,))
+    await state.clear()
+    await message.answer("Chiqdingiz.", reply_markup=ReplyKeyboardRemove())
+
+
+@router.message(F.text == "➕ Sotuvchi qoshish")
+async def add_seller_start(message, state):
+    if not is_owner(message.from_user.id):
+        return
+    await state.set_state(AddSeller.name)
+    await message.answer("Yangi sotuvchi ism-familiyasini yozing:", reply_markup=cancel_kb())
+
+
+@router.message(AddSeller.name)
+async def add_seller_done(message, state):
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+        return
+    name = message.text.strip()
+    code = gen_code()
+    q("INSERT INTO sellers(name, code, created_at) VALUES(?,?,?)", (name, code, datetime.now().isoformat(timespec="seconds")))
+    await state.clear()
+    await message.answer(f"✅ Sotuvchi qoshildi!{N}{N}Ism: <b>{name}</b>{N}Kod: <code>{code}</code>{N}{N}Sotuvchiga ayting: botga kirib <b>/kirish</b> yozsin va shu kodni kiritsin.", reply_markup=owner_menu())
+    await sync_sheet()
+
+
+@router.message(F.text == "🗑 Sotuvchi ochirish")
+async def del_seller_start(message, state):
+    if not is_owner(message.from_user.id):
+        return
+    await state.set_state(DelSeller.code)
+    await message.answer("Ochiriladigan sotuvchi kodini yozing:", reply_markup=cancel_kb())
+
+
+@router.message(DelSeller.code)
+async def del_seller_done(message, state):
+    if message.text == "❌ Bekor qilish":
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=owner_menu())
+        return
+    code = message.text.strip()
+    seller = q("SELECT * FROM sellers WHERE code=?", (code,), fetch="one")
+    await state.clear()
+    if not seller:
+        await message.answer("Bunday kod topilmadi.", reply_markup=owner_menu())
+        return
+    q("DELETE FROM sellers WHERE id=?", (seller["id"],))
+    await message.answer(f"🗑 Sotuvchi ochirildi: {seller['name']} (savdolari saqlanib qoladi).", reply_markup=owner_menu())
+    await sync_sheet()
+
+
+@router.message(F.text == "🧾 Sotuvchilar")
+async def sellers_list(message):
+    if not is_owner(message.from_user.id):
+        return
+    rows = q("SELECT s.id, s.name, s.code, s.telegram_id, COUNT(sa.id) cnt, COALESCE(SUM(sa.amount),0) turn, COALESCE(SUM(sa.bonus),0) bon FROM sellers s LEFT JOIN sales sa ON sa.seller_id=s.id GROUP BY s.id ORDER BY turn DESC", fetch="all")
+    if not rows:
+        await message.answer("Hali sotuvchilar yoq. '➕ Sotuvchi qoshish' orqali qoshing.", reply_markup=owner_menu())
+        return
+    text = f"🧾 <b>SOTUVCHILAR</b>{N}{N}"
+    for r in rows:
+        link = "ulangan" if r["telegram_id"] else "ulanmagan"
+        text += f"👤 <b>{r['name']}</b> (kod: {r['code']}, {link}){N}   Savdolar: {r['cnt']} | Aylanma: {fmt(r['turn'])} | Bonus: {fmt(r['bon'])}{N}{N}"
+    await message.answer(text, reply_markup=owner_menu())
+
+
+@router.message(F.text == "📈 Mening natijam")
+async def my_result(message):
+    seller = get_seller_by_tg(message.from_user.id)
+    if not seller:
+        return
+    r = q("SELECT COUNT(*) cnt, COALESCE(SUM(amount),0) turn, COALESCE(SUM(bonus),0) bon FROM sales WHERE seller_id=?", (seller["id"],), fetch="one")
+    await message.answer(f"📈 <b>{seller['name']}</b> - natijangiz{N}{N}Savdolar soni: <b>{r['cnt']}</b>{N}Jami aylanma: <b>{fmt(r['turn'])}</b> som{N}Yozilgan bonus: <b>{fmt(r['bon'])}</b> som", reply_markup=seller_menu())
+
+
+@router.message(F.text == "👥 Mijozlar")
+async def clients_list(message):
+    if not is_owner(message.from_user.id):
+        return
+    rows = q("SELECT * FROM clients ORDER BY total_turnover DESC LIMIT 40", fetch="all")
+    if not rows:
+        await message.answer("Hali mijozlar yoq.", reply_markup=owner_menu())
+        return
+    text = f"👥 <b>HAMKORLAR (aylanma boyicha)</b>{N}{N}"
+    i = 0
+    for c in rows:
+        i += 1
+        text += f"{i}. {c['full_name']} - {fmt(c['total_turnover'])} som ({percent_for(c['total_turnover'])}%) | bonus: {fmt(c['total_bonus'])}{N}"
+    await message.answer(text, reply_markup=owner_menu())
+
+
+@router.message(F.text == "📊 Hisobot")
+async def report(message):
+    if not is_owner(message.from_user.id):
+        return
+    row = q("SELECT COUNT(*) c, COALESCE(SUM(total_turnover),0) t, COALESCE(SUM(total_bonus),0) b FROM clients", fetch="one")
+    scnt = q("SELECT COUNT(*) c FROM sales", fetch="one")["c"]
+    sellers = q("SELECT COUNT(*) c FROM sellers", fetch="one")["c"]
+    await message.answer(f"📊 <b>UMUMIY HISOBOT</b>{N}{N}Hamkorlar: <b>{row['c']}</b>{N}Sotuvchilar: <b>{sellers}</b>{N}Savdolar soni: <b>{scnt}</b>{N}Umumiy aylanma: <b>{fmt(row['t'])}</b> som{N}Jami berilgan bonus: <b>{fmt(row['b'])}</b> som", reply_markup=owner_menu())
+
+
+def _can_sell(uid):
+    return is_owner(uid) or get_seller_by_tg(uid) is not None
+
+
+def _actor_seller(uid):
+    s = get_seller_by_tg(uid)
+    if s:
+        return s["id"], s["name"]
+    return None, "Rahbar"
+
+
+def _actor_menu(uid):
+    if get_seller_by_tg(uid):
+        return seller_menu()
+    return owner_menu()
 
 
 @router.message(F.text == "➕ Savdo qoshish")
-async def sale_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+async def sale_start(message, state):
+    if not _can_sell(message.from_user.id):
         return
     await state.set_state(AddSale.phone)
     await message.answer(f"➕ <b>Yangi savdo</b>{N}{N}Mijoz telefon raqamini yuboring.{N}Masalan: 901234567", reply_markup=cancel_kb())
 
 
 @router.message(AddSale.phone)
-async def sale_phone(message: Message, state: FSMContext):
+async def sale_phone(message, state):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_menu())
+        await message.answer("Bekor qilindi.", reply_markup=_actor_menu(message.from_user.id))
         return
     phone = normalize_phone(message.text)
     if len(phone) < 9:
@@ -393,22 +576,17 @@ async def sale_phone(message: Message, state: FSMContext):
     if client:
         await state.update_data(client_id=client["id"])
         await state.set_state(AddSale.amount)
-        await message.answer(
-            f"Mijoz: <b>{client['full_name']}</b> ({client['category']}){N}"
-            f"Joriy aylanma: {fmt(client['total_turnover'])} som ({percent_for(client['total_turnover'])}%){N}{N}"
-            f"Savdo summasini kiriting (somda):",
-            reply_markup=cancel_kb(),
-        )
+        await message.answer(f"Mijoz: <b>{client['full_name']}</b> ({client['category']}){N}Joriy aylanma: {fmt(client['total_turnover'])} som ({percent_for(client['total_turnover'])}%){N}{N}Savdo summasini kiriting (somda):", reply_markup=cancel_kb())
     else:
         await state.set_state(AddSale.new_name)
         await message.answer(f"Bu raqam royxatda yoq. Yangi mijoz qoshamiz.{N}Mijozning <b>ism-familiyasini</b> yozing:", reply_markup=cancel_kb())
 
 
 @router.message(AddSale.new_name)
-async def sale_new_name(message: Message, state: FSMContext):
+async def sale_new_name(message, state):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_menu())
+        await message.answer("Bekor qilindi.", reply_markup=_actor_menu(message.from_user.id))
         return
     await state.update_data(new_name=message.text.strip())
     await state.set_state(AddSale.new_category)
@@ -416,24 +594,23 @@ async def sale_new_name(message: Message, state: FSMContext):
 
 
 @router.message(AddSale.new_category)
-async def sale_new_category(message: Message, state: FSMContext):
+async def sale_new_category(message, state):
     cat = message.text.strip()
     if cat not in CATEGORIES:
         await message.answer("Tugmalardan birini tanlang.")
         return
     data = await state.get_data()
-    now = datetime.now().isoformat(timespec="seconds")
-    client_id = q("INSERT INTO clients(phone, full_name, category, created_at) VALUES(?,?,?,?)", (data["phone"], data["new_name"], cat, now))
-    await state.update_data(client_id=client_id)
+    cid = q("INSERT INTO clients(phone, full_name, category, created_at) VALUES(?,?,?,?)", (data["phone"], data["new_name"], cat, datetime.now().isoformat(timespec="seconds")))
+    await state.update_data(client_id=cid)
     await state.set_state(AddSale.amount)
     await message.answer(f"✅ Yangi mijoz qoshildi: <b>{data['new_name']}</b>{N}{N}Savdo summasini kiriting (somda):", reply_markup=cancel_kb())
 
 
 @router.message(AddSale.amount)
-async def sale_amount(message: Message, state: FSMContext):
+async def sale_amount(message, state):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_menu())
+        await message.answer("Bekor qilindi.", reply_markup=_actor_menu(message.from_user.id))
         return
     amount = parse_amount(message.text)
     if not amount or amount <= 0:
@@ -445,10 +622,10 @@ async def sale_amount(message: Message, state: FSMContext):
 
 
 @router.message(AddSale.customer)
-async def sale_customer(message: Message, state: FSMContext):
+async def sale_customer(message, state):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_menu())
+        await message.answer("Bekor qilindi.", reply_markup=_actor_menu(message.from_user.id))
         return
     customer = "" if message.text.strip() == "-" else message.text.strip()
     data = await state.get_data()
@@ -460,111 +637,79 @@ async def sale_customer(message: Message, state: FSMContext):
     after = before + amount
     await state.update_data(customer=customer, percent=pct, bonus=bonus, after=after)
     await state.set_state(AddSale.confirm)
-    confirm_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Tasdiqlash"), KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="✅ Tasdiqlash"), KeyboardButton(text="❌ Bekor qilish")]], resize_keyboard=True)
     msg = (
         f"🧾 <b>Tekshiring:</b>{N}"
         f"Mijoz: <b>{client['full_name']}</b> ({client['category']}){N}"
         f"Savdo summasi: <b>{fmt(amount)}</b> som{N}"
-        f"Qollanadigan foiz: <b>{pct}%</b>{N}"
+        f"Foiz: <b>{pct}%</b>{N}"
         f"Bonus: <b>{fmt(bonus)}</b> som{N}"
-        f"Yangi jami aylanma: <b>{fmt(after)}</b> som (keyingi bosqich: {percent_for(after)}%){N}"
+        f"Yangi aylanma: <b>{fmt(after)}</b> som (keyingi bosqich: {percent_for(after)}%){N}"
     )
     if customer:
         msg += f"Xaridor: {customer}{N}"
     msg += f"{N}Togrimi?"
-    await message.answer(msg, reply_markup=confirm_kb)
+    await message.answer(msg, reply_markup=kb)
 
 
 @router.message(AddSale.confirm)
-async def sale_confirm(message: Message, state: FSMContext):
+async def sale_confirm(message, state):
+    uid = message.from_user.id
     if message.text != "✅ Tasdiqlash":
         await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_menu())
+        await message.answer("Bekor qilindi.", reply_markup=_actor_menu(uid))
         return
     data = await state.get_data()
+    sid, sname = _actor_seller(uid)
     now = datetime.now().isoformat(timespec="seconds")
     client = q("SELECT * FROM clients WHERE id=?", (data["client_id"],), fetch="one")
-    q("INSERT INTO sales(client_id, amount, percent, bonus, turnover_after, customer, admin_id, created_at) VALUES(?,?,?,?,?,?,?,?)", (data["client_id"], data["amount"], data["percent"], data["bonus"], data["after"], data.get("customer", ""), message.from_user.id, now))
+    q("INSERT INTO sales(client_id, amount, percent, bonus, turnover_after, customer, seller_id, seller_name, created_at) VALUES(?,?,?,?,?,?,?,?,?)", (data["client_id"], data["amount"], data["percent"], data["bonus"], data["after"], data.get("customer", ""), sid, sname, now))
     q("UPDATE clients SET total_turnover=?, total_bonus=total_bonus+? WHERE id=?", (data["after"], data["bonus"], data["client_id"]))
     await state.clear()
-    await message.answer(f"✅ Saqlandi!{N}Bonus: <b>{fmt(data['bonus'])}</b> som ({data['percent']}%)", reply_markup=admin_menu())
+    await message.answer(f"✅ Saqlandi! (kiritdi: {sname}){N}Bonus: <b>{fmt(data['bonus'])}</b> som ({data['percent']}%)", reply_markup=_actor_menu(uid))
     if client["telegram_id"]:
         try:
-            await bot.send_message(client["telegram_id"], f"🛍 Yangi savdo qayd etildi!{N}{N}Summa: <b>{fmt(data['amount'])}</b> som{N}Bonus ({data['percent']}%): <b>{fmt(data['bonus'])}</b> som{N}Jami aylanma: <b>{fmt(data['after'])}</b> som")
+            await bot.send_message(client["telegram_id"], f"🛍 Yangi savdo!{N}{N}Summa: <b>{fmt(data['amount'])}</b> som{N}Bonus ({data['percent']}%): <b>{fmt(data['bonus'])}</b> som{N}Jami aylanma: <b>{fmt(data['after'])}</b> som")
         except Exception as e:
-            logger.warning("Mijozga xabar yuborilmadi: %s", e)
+            logger.warning("Mijozga xabar: %s", e)
+    await sync_sheet()
 
 
 @router.message(F.text == "🔍 Mijozni tekshirish")
-async def lookup_start(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+async def lookup_start(message, state):
+    if not _can_sell(message.from_user.id):
         return
     await state.set_state(Lookup.phone)
     await message.answer("Mijoz telefon raqamini yuboring:", reply_markup=cancel_kb())
 
 
 @router.message(Lookup.phone)
-async def lookup_phone(message: Message, state: FSMContext):
+async def lookup_phone(message, state):
     if message.text == "❌ Bekor qilish":
         await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_menu())
+        await message.answer("Bekor qilindi.", reply_markup=_actor_menu(message.from_user.id))
         return
     phone = normalize_phone(message.text)
     client = get_client_by_phone(phone)
     await state.clear()
     if not client:
-        await message.answer("Bunday mijoz topilmadi.", reply_markup=admin_menu())
+        await message.answer("Bunday mijoz topilmadi.", reply_markup=_actor_menu(message.from_user.id))
         return
-    turnover = client["total_turnover"]
-    await message.answer(
-        f"👤 <b>{client['full_name']}</b> ({client['category']}){N}"
-        f"Raqam: {client['phone']}{N}"
-        f"Jami aylanma: <b>{fmt(turnover)}</b> som ({percent_for(turnover)}%){N}"
-        f"Jami bonus: <b>{fmt(client['total_bonus'])}</b> som",
-        reply_markup=admin_menu(),
-    )
-
-
-@router.message(F.text == "👥 Mijozlar")
-async def clients_list(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    rows = q("SELECT * FROM clients ORDER BY total_turnover DESC LIMIT 30", fetch="all")
-    if not rows:
-        await message.answer("Hali mijozlar yoq.", reply_markup=admin_menu())
-        return
-    text = f"👥 <b>Mijozlar (aylanma boyicha):</b>{N}"
-    i = 0
-    for c in rows:
-        i += 1
-        text += f"{i}. {c['full_name']} - {fmt(c['total_turnover'])} som ({percent_for(c['total_turnover'])}%){N}"
-    await message.answer(text, reply_markup=admin_menu())
-
-
-@router.message(F.text == "📊 Hisobot")
-async def report(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    row = q("SELECT COUNT(*) c, COALESCE(SUM(total_turnover),0) t, COALESCE(SUM(total_bonus),0) b FROM clients", fetch="one")
-    sales_cnt = q("SELECT COUNT(*) c FROM sales", fetch="one")["c"]
-    await message.answer(
-        f"📊 <b>UMUMIY HISOBOT</b>{N}"
-        f"Mijozlar: <b>{row['c']}</b>{N}"
-        f"Savdolar soni: <b>{sales_cnt}</b>{N}"
-        f"Jami aylanma: <b>{fmt(row['t'])}</b> som{N}"
-        f"Jami berilgan bonus: <b>{fmt(row['b'])}</b> som",
-        reply_markup=admin_menu(),
-    )
+    tt = client["total_turnover"]
+    await message.answer(f"👤 <b>{client['full_name']}</b> ({client['category']}){N}Raqam: {client['phone']}{N}Jami aylanma: <b>{fmt(tt)}</b> som ({percent_for(tt)}%){N}Jami bonus: <b>{fmt(client['total_bonus'])}</b> som", reply_markup=_actor_menu(message.from_user.id))
 
 
 @router.message()
-async def fallback(message: Message):
-    if is_admin(message.from_user.id):
-        await message.answer("Menyudan tanlang:", reply_markup=admin_menu())
-    elif get_client_by_tg(message.from_user.id):
+async def fallback(message):
+    uid = message.from_user.id
+    if is_owner(uid):
+        await message.answer("Menyudan tanlang:", reply_markup=owner_menu())
+    elif get_seller_by_tg(uid):
+        await message.answer("Menyudan tanlang:", reply_markup=seller_menu())
+    elif get_client_by_tg(uid):
         await message.answer("Menyudan tanlang:", reply_markup=client_menu())
     else:
-        await message.answer("Boshlash uchun /start ni bosing.")
+        await message.answer("Boshlash uchun /start ni bosing. Sotuvchilar uchun: /kirish")
 
 
 async def main():
